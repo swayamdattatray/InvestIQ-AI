@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+@theme {
+  --color-dark: #0a0a0a;
+  --color-dark-lighter: #121212;
+  --color-dark-card: #1e1e1e;
+  
+  --color-brand-primary: #00d09c;
+  --color-brand-secondary: #5367ff;
+
+  --font-sans: "Plus Jakarta Sans", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+}
+
+@utility glass {
+  background-color: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+@utility glass-card {
+  @apply glass rounded-2xl p-6 transition-all duration-300;
+}
+
+@utility btn-primary {
+  @apply px-6 py-2 bg-brand-primary text-dark font-semibold rounded-lg transition-all active:scale-95;
+  
+  &:hover {
+    background-color: color-mix(in srgb, var(--color-brand-primary) 90%, transparent);
+  }
+}
+
+@utility btn-outline {
+  @apply px-6 py-2 border border-brand-primary text-brand-primary font-semibold rounded-lg transition-all active:scale-95;
+  
+  &:hover {
+    background-color: var(--color-brand-primary);
+    color: var(--color-dark);
+  }
+}
+
+@utility gradient-text {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-brand-primary to-brand-secondary;
+}
+
+:root {
+  --bg-dark: #0a0a0a;
+  --card-bg: rgba(30, 30, 30, 0.7);
+  --accent: #00d09c;
+  --accent-secondary: #5367ff;
+}
+
+@layer base {
+  body {
+    @apply bg-dark text-gray-100 antialiased selection:bg-brand-primary selection:text-dark font-sans;
+    background-color: var(--bg-dark);
+  }
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-dark);
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-800 rounded-full hover:bg-gray-700;
+}

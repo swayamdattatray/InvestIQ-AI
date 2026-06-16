@@ -13,29 +13,41 @@ class DataService:
         self.base_url = "https://www.alphavantage.co/query"
         self.api_key = settings.ALPHA_VANTAGE_API_KEY
 
+    def _normalize_symbol(self, symbol: str) -> str:
+        """
+        Maps standard suffixes to Alpha Vantage specific ones.
+        Yahoo Finance (.NS) -> Alpha Vantage (.BSE)
+        Alpha Vantage often has better coverage for .BSE than .NSE.
+        """
+        s = symbol.upper()
+        if s.endswith(".NS"):
+            return s.replace(".NS", ".BSE")
+        return s
+
     async def get_stock_data(self, symbol: str) -> StockPrice:
         """
         Fetches stock data from Alpha Vantage API.
         Uses GLOBAL_QUOTE for the latest price and OVERVIEW for metadata.
         """
-        print(f"DEBUG: Starting async fetch for symbol: {symbol}")
+        normalized_symbol = self._normalize_symbol(symbol)
+        print(f"DEBUG: Starting async fetch for symbol: {symbol} (Mapped to: {normalized_symbol})")
         
         async with httpx.AsyncClient() as client:
             # Prepare requests
             quote_params = {
                 "function": "GLOBAL_QUOTE",
-                "symbol": symbol,
+                "symbol": normalized_symbol,
                 "apikey": self.api_key
             }
             overview_params = {
                 "function": "OVERVIEW",
-                "symbol": symbol,
+                "symbol": normalized_symbol,
                 "apikey": self.api_key
             }
 
             try:
                 # Fetch both concurrently
-                print(f"DEBUG: Requesting Alpha Vantage data for {symbol}...")
+                print(f"DEBUG: Requesting Alpha Vantage data for {normalized_symbol}...")
                 responses = await asyncio.gather(
                     client.get(self.base_url, params=quote_params, timeout=10.0),
                     client.get(self.base_url, params=overview_params, timeout=10.0)
@@ -48,16 +60,31 @@ class DataService:
                 quote_data = quote_resp.json()
                 overview_data = overview_resp.json()
 
+                # Essential data check
                 self._check_api_errors(quote_data, overview_data)
-
+                
                 quote = quote_data.get("Global Quote", {})
                 if not quote or "05. price" not in quote:
-                    raise HTTPException(status_code=404, detail=f"Stock symbol '{symbol}' not found.")
+                    raise HTTPException(status_code=404, detail=f"Stock symbol '{symbol}' (mapped to '{normalized_symbol}') not found or not supported by the data provider.")
 
                 price = float(quote["05. price"])
-                name = overview_data.get("Name", symbol.upper())
-                currency = overview_data.get("Currency", "USD")
-                exchange = overview_data.get("Exchange", "Unknown")
+
+                # Metadata handling with fallback for international stocks
+                # OVERVIEW often fails for non-US symbols
+                name = overview_data.get("Name")
+                currency = overview_data.get("Currency")
+                exchange = overview_data.get("Exchange")
+
+                if not name or not currency:
+                    # Fallback logic for Indian stocks
+                    if normalized_symbol.endswith(".BSE") or normalized_symbol.endswith(".NSE"):
+                        name = name or symbol.split(".")[0]
+                        currency = currency or "INR"
+                        exchange = exchange or ("NSE" if ".NSE" in normalized_symbol else "BSE")
+                    else:
+                        name = name or normalized_symbol
+                        currency = currency or "USD"
+                        exchange = exchange or "Unknown"
 
                 return StockPrice(
                     symbol=symbol.upper(),
@@ -77,12 +104,13 @@ class DataService:
         """
         Fetches historical data and calculates RSI, MA50, MA200, and Volatility.
         """
-        print(f"DEBUG: Starting analysis for symbol: {symbol}")
+        normalized_symbol = self._normalize_symbol(symbol)
+        print(f"DEBUG: Starting analysis for symbol: {symbol} (Mapped to: {normalized_symbol})")
         
         async with httpx.AsyncClient() as client:
             params = {
                 "function": "TIME_SERIES_DAILY",
-                "symbol": symbol,
+                "symbol": normalized_symbol,
                 "outputsize": "full", # Required for 200-day MA
                 "apikey": self.api_key
             }
