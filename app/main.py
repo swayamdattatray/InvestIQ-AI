@@ -2,13 +2,25 @@ from fastapi import FastAPI, HTTPException
 from app.core.config import settings
 from app.models.schemas import HealthResponse, StockPrice, StockAnalysis
 from app.services.data_service import data_service
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
     openapi_url=f"{settings.API_V1_STR}/openapi.json"
 )
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     return HealthResponse(status="ok", version=settings.VERSION)

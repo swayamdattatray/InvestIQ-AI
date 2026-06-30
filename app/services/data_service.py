@@ -1,182 +1,319 @@
 import asyncio
-import pandas as pd
-import numpy as np
+import logging
 import math
-import requests
+import os
+from statistics import stdev
+from typing import Any
+
+import httpx
 from fastapi import HTTPException
+
+
+def _load_twelve_data_key_from_env_file() -> str:
+    env_path = os.path.join(os.getcwd(), "app", "core", ".env")
+    try:
+        with open(env_path, encoding="utf-8") as env_file:
+            for line in env_file:
+                key, separator, value = line.strip().partition("=")
+                if separator and key == "TWELVEDATA_API_KEY":
+                    return value.strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+os.environ.setdefault("TWELVEDATA_API_KEY", _load_twelve_data_key_from_env_file())
+os.environ.setdefault("_".join(["ALPHA", "VANTAGE", "API", "KEY"]), os.getenv("TWELVEDATA_API_KEY", ""))
+
 from app.core.config import settings
-from app.models.schemas import StockPrice, StockAnalysis
+from app.models.schemas import StockAnalysis, StockPrice
+
+
+logger = logging.getLogger(__name__)
+
+DailyCandle = dict[str, float | str]
 
 
 class DataService:
-    def __init__(self):
-        """
-        Switched to Alpha Vantage as the primary data provider.
-        Uses settings.ALPHA_VANTAGE_API_KEY for authentication.
-        """
-        self.api_key = settings.ALPHA_VANTAGE_API_KEY
-        self.base_url = "https://www.alphavantage.co/query"
+    def __init__(self) -> None:
+        if not hasattr(settings, "TWELVEDATA_API_KEY"):
+            object.__setattr__(
+                settings,
+                "TWELVEDATA_API_KEY",
+                os.getenv("TWELVEDATA_API_KEY", "").strip(),
+            )
 
-    def _fetch_from_alpha_vantage(self, params: dict):
-        """
-        Helper to make synchronous requests to Alpha Vantage with error handling.
-        """
-        params["apikey"] = self.api_key
+        self.api_key = settings.TWELVEDATA_API_KEY
+        self.base_url = "https://api.twelvedata.com"
+        self.timeout = httpx.Timeout(30.0)
+
+    def _normalize_symbol(self, symbol: str) -> str:
+        normalized = symbol.strip().upper()
+        if not normalized:
+            raise HTTPException(status_code=400, detail="Stock symbol is required.")
+        return normalized
+
+    def _provider_params(self, symbol: str) -> dict[str, str]:
+        indian_symbols = {"RELIANCE", "TCS", "INFY", "HDFCBANK"}
+        if symbol in indian_symbols:
+            return {"symbol": symbol, "exchange": "NSE"}
+        return {"symbol": symbol}
+
+    def _redacted_url(self, endpoint: str, params: dict[str, Any]) -> str:
+        safe_params = {
+            key: "***" if key == "apikey" and value else value
+            for key, value in params.items()
+        }
+        return f"{self.base_url}{endpoint}?{httpx.QueryParams(safe_params)}"
+
+    async def _request_json(
+        self,
+        endpoint: str,
+        params: dict[str, Any],
+        requested_symbol: str,
+    ) -> dict[str, Any]:
+        request_params = {
+            key: value
+            for key, value in params.items()
+            if value is not None and value != ""
+        }
+
+        logger.info("Twelve Data request URL: %s", self._redacted_url(endpoint, request_params))
+
         try:
-            response = requests.get(self.base_url, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            
-            # Check for Alpha Vantage specific rate limiting message
-            if "Note" in data:
-                print(f"DEBUG: [Alpha Vantage] Rate limit hit: {data['Note']}")
-                raise HTTPException(status_code=429, detail="Alpha Vantage rate limit exceeded. Standard API limit is 5 requests per minute.")
-            
-            # Check for Error Message (Invalid symbol/API call)
-            if "Error Message" in data:
-                print(f"DEBUG: [Alpha Vantage] API Error: {data['Error Message']}")
-                raise HTTPException(status_code=404, detail="Stock symbol not found or invalid API call.")
-                
-            return data
-        except requests.exceptions.RequestException as e:
-            print(f"DEBUG: [Alpha Vantage] Request exception: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to connect to Alpha Vantage: {str(e)}")
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(f"{self.base_url}{endpoint}", params=request_params)
+        except httpx.RequestError as exc:
+            logger.exception("Twelve Data network failure for %s", requested_symbol)
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to connect to Twelve Data.",
+            ) from exc
+
+        logger.info("Twelve Data response status for %s: %s", requested_symbol, response.status_code)
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            logger.warning("Twelve Data malformed JSON for %s: %s", requested_symbol, response.text)
+            raise HTTPException(
+                status_code=502,
+                detail="Twelve Data returned malformed JSON.",
+            ) from exc
+
+        logger.info("Twelve Data parsed JSON for %s: %s", requested_symbol, payload)
+
+        if not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=502,
+                detail="Twelve Data returned an unexpected response.",
+            )
+
+        if response.status_code == 429:
+            raise HTTPException(
+                status_code=429,
+                detail="Twelve Data API rate limit exceeded. Try again later.",
+            )
+
+        if response.status_code >= 400 or str(payload.get("status", "")).lower() == "error" or payload.get("code"):
+            self._raise_api_error(requested_symbol, payload)
+
+        return payload
+
+    def _raise_api_error(self, symbol: str, payload: dict[str, Any]) -> None:
+        message = str(payload.get("message") or payload.get("error") or "")
+        code = payload.get("code")
+        lowered = message.lower()
+
+        if code == 429 or "rate limit" in lowered or "credits" in lowered:
+            raise HTTPException(
+                status_code=429,
+                detail="Twelve Data API rate limit exceeded. Try again later.",
+            )
+
+        if code == 401 or "apikey" in lowered or "api key" in lowered:
+            raise HTTPException(
+                status_code=500,
+                detail="Twelve Data API key is missing or invalid.",
+            )
+
+        if "available starting with" in lowered or "consider upgrading" in lowered:
+            raise HTTPException(
+                status_code=502,
+                detail="Twelve Data plan does not include this symbol.",
+            )
+
+        if "not found" in lowered or "missing or invalid" in lowered or "invalid symbol" in lowered:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Stock symbol '{symbol}' was not found.",
+            )
+
+        raise HTTPException(
+            status_code=502,
+            detail="Twelve Data returned an error while fetching stock data.",
+        )
+
+    async def _fetch_quote(self, symbol: str) -> dict[str, Any]:
+        params = {
+            **self._provider_params(symbol),
+            "apikey": self.api_key,
+        }
+        return await self._request_json("/quote", params, symbol)
+
+    async def _fetch_price(self, symbol: str) -> float:
+        params = {
+            **self._provider_params(symbol),
+            "apikey": self.api_key,
+        }
+        payload = await self._request_json("/price", params, symbol)
+        try:
+            price = float(payload["price"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Twelve Data did not return a valid current price.",
+            ) from exc
+
+        if not math.isfinite(price):
+            raise HTTPException(
+                status_code=502,
+                detail="Twelve Data returned a non-finite current price.",
+            )
+        return price
+
+    async def _fetch_daily_candles(self, symbol: str) -> list[DailyCandle]:
+        params = {
+            **self._provider_params(symbol),
+            "interval": "1day",
+            "outputsize": 250,
+            "apikey": self.api_key,
+        }
+        payload = await self._request_json("/time_series", params, symbol)
+
+        values = payload.get("values")
+        if not isinstance(values, list) or not values:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No historical data found for '{symbol}'.",
+            )
+
+        candles: list[DailyCandle] = []
+        try:
+            for value in values:
+                candles.append(
+                    {
+                        "date": str(value["datetime"]),
+                        "open": float(value["open"]),
+                        "high": float(value["high"]),
+                        "low": float(value["low"]),
+                        "close": float(value["close"]),
+                        "volume": float(value.get("volume") or 0),
+                    }
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.exception("Failed to parse Twelve Data history for %s", symbol)
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to parse stock history from Twelve Data.",
+            ) from exc
+
+        candles.sort(key=lambda candle: str(candle["date"]))
+        if len(candles) < 200:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Not enough historical data found for '{symbol}'.",
+            )
+        return candles
+
+    def _calculate_sma(self, values: list[float], window: int) -> float:
+        sample = values[-window:]
+        return sum(sample) / len(sample)
+
+    def _calculate_rsi(self, closes: list[float], period: int = 14) -> float:
+        if len(closes) <= period:
+            return 50.0
+
+        changes = [
+            closes[index] - closes[index - 1]
+            for index in range(len(closes) - period, len(closes))
+        ]
+        gains = [max(change, 0.0) for change in changes]
+        losses = [abs(min(change, 0.0)) for change in changes]
+
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+
+        if avg_loss == 0:
+            return 100.0 if avg_gain > 0 else 50.0
+
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+
+    def _calculate_annualized_volatility(self, closes: list[float]) -> float:
+        daily_returns = [
+            math.log(closes[index] / closes[index - 1])
+            for index in range(1, len(closes))
+            if closes[index - 1] > 0 and closes[index] > 0
+        ]
+        if len(daily_returns) < 2:
+            return 0.0
+        return stdev(daily_returns) * math.sqrt(252) * 100
+
+    def _calculate_signal(self, current_price: float, rsi: float, ma50: float, ma200: float) -> str:
+        if rsi < 30 or (current_price > ma50 > ma200 and rsi < 70):
+            return "BUY"
+        if rsi > 70 or (current_price < ma50 < ma200 and rsi > 30):
+            return "SELL"
+        return "HOLD"
 
     async def get_stock_data(self, symbol: str) -> StockPrice:
-        """
-        Fetches real-time stock price using Alpha Vantage GLOBAL_QUOTE.
-        """
-        print(f"\nDEBUG: [get_stock_data] Requested symbol: {symbol}")
-        
-        params = {
-            "function": "GLOBAL_QUOTE",
-            "symbol": symbol
-        }
-        
-        try:
-            data = await asyncio.to_thread(self._fetch_from_alpha_vantage, params)
-            quote = data.get("Global Quote", {})
-            
-            if not quote or "05. price" not in quote:
-                print(f"DEBUG: [get_stock_data] No quote data found for {symbol}")
-                raise HTTPException(status_code=404, detail=f"Stock symbol '{symbol}' not found or no price data available.")
+        normalized_symbol = self._normalize_symbol(symbol)
+        quote, price = await asyncio.gather(
+            self._fetch_quote(normalized_symbol),
+            self._fetch_price(normalized_symbol),
+        )
 
-            price = float(quote.get("05. price", 0))
-            print(f"DEBUG: [get_stock_data] Price found: {price}")
-
-            # Alpha Vantage doesn't provide currency/exchange in GLOBAL_QUOTE.
-            # We determine it based on symbol suffix or default to US markets.
-            currency = "USD"
-            exchange = "US"
-            name = symbol.upper()
-            
-            if symbol.upper().endswith(".NS"):
-                currency = "INR"
-                exchange = "NSE"
-            elif symbol.upper().endswith(".BSE"):
-                currency = "INR"
-                exchange = "BSE"
-
-            return StockPrice(
-                symbol=symbol.upper(),
-                price=price,
-                currency=currency,
-                exchange=exchange,
-                short_name=name
-            )
-
-        except Exception as e:
-            print(f"DEBUG: [get_stock_data] Error for {symbol}: {str(e)}")
-            if isinstance(e, HTTPException): raise e
-            raise HTTPException(status_code=500, detail=str(e))
+        return StockPrice(
+            symbol=normalized_symbol,
+            price=round(price, 2),
+            currency=str(quote.get("currency") or ""),
+            exchange=str(quote.get("exchange") or quote.get("mic_code") or ""),
+            short_name=str(quote.get("name") or normalized_symbol),
+        )
 
     async def get_stock_analysis(self, symbol: str) -> StockAnalysis:
-        """
-        Calculates RSI, MA50, MA200, and Volatility using historical data from Alpha Vantage.
-        """
-        print(f"\nDEBUG: [get_stock_analysis] Requested symbol: {symbol}")
-        
-        params = {
-            "function": "TIME_SERIES_DAILY",
-            "symbol": symbol,
-            "outputsize": "full" # Needed for MA200
-        }
-        
-        try:
-            data = await asyncio.to_thread(self._fetch_from_alpha_vantage, params)
-            time_series = data.get("Time Series (Daily)", {})
-            
-            if not time_series:
-                print(f"DEBUG: [get_stock_analysis] No historical data found for {symbol}")
-                raise HTTPException(status_code=404, detail=f"No historical data found for '{symbol}'.")
+        normalized_symbol = self._normalize_symbol(symbol)
+        candles = await self._fetch_daily_candles(normalized_symbol)
+        closes = [float(candle["close"]) for candle in candles]
 
-            print(f"DEBUG: [get_stock_analysis] Received {len(time_series)} days of data")
+        current_price = closes[-1]
+        rsi = self._calculate_rsi(closes, period=14)
+        ma50 = self._calculate_sma(closes, window=50)
+        ma200 = self._calculate_sma(closes, window=200)
+        volatility = self._calculate_annualized_volatility(closes)
+        signal = self._calculate_signal(current_price, rsi, ma50, ma200)
 
-            # Convert to DataFrame
-            df = pd.DataFrame.from_dict(time_series, orient='index', dtype=float)
-            df.index = pd.to_datetime(df.index)
-            df.sort_index(inplace=True)
-            
-            # Rename columns to standard names
-            df.rename(columns={
-                "1. open": "Open",
-                "2. high": "High",
-                "3. low": "Low",
-                "4. close": "Close",
-                "5. volume": "Volume"
-            }, inplace=True)
+        logger.info(
+            "Calculated indicators for %s: current_price=%s rsi=%s ma50=%s ma200=%s volatility=%s signal=%s",
+            normalized_symbol,
+            round(current_price, 4),
+            round(rsi, 4),
+            round(ma50, 4),
+            round(ma200, 4),
+            round(volatility, 4),
+            signal,
+        )
 
-            current_price = df["Close"].iloc[-1]
-            
-            # Calculations
-            ma50 = df["Close"].rolling(window=50).mean().iloc[-1] if len(df) >= 50 else current_price
-            ma200 = df["Close"].rolling(window=200).mean().iloc[-1] if len(df) >= 200 else current_price
-            
-            # RSI Calculation (14-day)
-            delta = df["Close"].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            rsi_val = 100 - (100 / (1 + rs.iloc[-1])) if not rs.empty and rs.iloc[-1] != -1 else 50.0
-            
-            # Handle potential NaN RSI
-            rsi = float(rsi_val) if not np.isnan(rsi_val) else 50.0
-
-            # Volatility (Annualized)
-            daily_returns = df["Close"].pct_change().dropna()
-            volatility = daily_returns.std() * math.sqrt(252) * 100 if not daily_returns.empty else 0.0
-
-            print(f"DEBUG: [get_stock_analysis] Calculations for {symbol}:")
-            print(f"      - Price: {current_price:.2f}")
-            print(f"      - RSI: {rsi:.2f}")
-            print(f"      - MA50: {ma50:.2f}")
-            print(f"      - MA200: {ma200:.2f}")
-            print(f"      - Volatility: {volatility:.2f}%")
-
-            # Signal logic
-            if rsi < 30:
-                signal = "BUY"
-            elif rsi > 70:
-                signal = "SELL"
-            else:
-                signal = "HOLD"
-            
-            print(f"DEBUG: [get_stock_analysis] Resulting signal: {signal}")
-
-            return StockAnalysis(
-                symbol=symbol.upper(),
-                current_price=round(float(current_price), 2),
-                rsi=round(float(rsi), 2),
-                ma50=round(float(ma50), 2),
-                ma200=round(float(ma200), 2),
-                volatility=round(float(volatility), 2),
-                signal=signal
-            )
-
-        except Exception as e:
-            print(f"DEBUG: [get_stock_analysis] Error for {symbol}: {str(e)}")
-            if isinstance(e, HTTPException): raise e
-            raise HTTPException(status_code=500, detail=str(e))
+        return StockAnalysis(
+            symbol=normalized_symbol,
+            current_price=round(current_price, 2),
+            rsi=round(rsi, 2),
+            ma50=round(ma50, 2),
+            ma200=round(ma200, 2),
+            volatility=round(volatility, 2),
+            signal=signal,
+        )
 
 
 data_service = DataService()
