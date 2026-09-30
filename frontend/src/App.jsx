@@ -5,6 +5,9 @@ import Landing from './pages/Landing';
 import Dashboard from './pages/Dashboard';
 import StockDetail from './pages/StockDetail';
 import Portfolio from './pages/Portfolio';
+import PaperTrading from './pages/PaperTrading';
+import Backtest from './pages/Backtest';
+import LearnTrading from './pages/LearnTrading';
 
 function App() {
   return (
@@ -15,6 +18,9 @@ function App() {
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/stock/:symbol" element={<StockDetail />} />
           <Route path="/portfolio" element={<Portfolio />} />
+          <Route path="/paper-trading" element={<PaperTrading />} />
+          <Route path="/backtest" element={<Backtest />} />
+          <Route path="/learn" element={<LearnTrading />} />
         </Routes>
       </MainLayout>
     </Router>

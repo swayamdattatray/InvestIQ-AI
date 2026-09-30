@@ -1,5 +1,6 @@
 import React from 'react';
 import Navbar from '../components/common/Navbar';
+import AIGuide from '../components/common/AIGuide';
 import { motion } from 'framer-motion';
 
 const MainLayout = ({ children }) => {
@@ -20,6 +21,7 @@ const MainLayout = ({ children }) => {
           © {new Date().getFullYear()} InvestIQ-AI. Built for Modern Investors.
         </div>
       </footer>
+      <AIGuide />
     </div>
   );
 };

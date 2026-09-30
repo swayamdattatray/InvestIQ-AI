@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { TrendingUp, LayoutDashboard, Briefcase, Search } from 'lucide-react';
+import { TrendingUp, LayoutDashboard, Briefcase, Search, FlaskConical, BarChart3, GraduationCap } from 'lucide-react';
 import { motion } from 'framer-motion';
 
 import GlobalSearch from './GlobalSearch';
@@ -10,6 +10,9 @@ const Navbar = () => {
 
   const navItems = [
     { name: 'Dashboard', path: '/dashboard', icon: LayoutDashboard },
+    { name: 'Paper Trade', path: '/paper-trading', icon: BarChart3 },
+    { name: 'Backtest', path: '/backtest', icon: FlaskConical },
+    { name: 'Learn', path: '/learn', icon: GraduationCap },
     { name: 'Portfolio', path: '/portfolio', icon: Briefcase },
   ];
 
@@ -28,7 +31,7 @@ const Navbar = () => {
         </div>
 
         <div className="flex items-center gap-6">
-          <div className="hidden lg:flex items-center gap-8 mr-4">
+          <div className="hidden lg:flex items-center gap-6 mr-4">
             {navItems.map((item) => {
               const Icon = item.icon;
               const isActive = location.pathname === item.path;
@@ -36,11 +39,11 @@ const Navbar = () => {
                 <Link
                   key={item.path}
                   to={item.path}
-                  className={`flex items-center gap-2 text-sm font-medium transition-colors hover:text-brand-primary ${
+                  className={`flex items-center gap-1.5 text-sm font-medium transition-colors hover:text-brand-primary ${
                     isActive ? 'text-brand-primary' : 'text-gray-400'
                   }`}
                 >
-                  <Icon size={18} />
+                  <Icon size={16} />
                   {item.name}
                 </Link>
               );

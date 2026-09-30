@@ -267,6 +267,96 @@ class DataService:
             return "SELL"
         return "HOLD"
 
+    def _calculate_max_drawdown(self, closes: list[float]) -> float:
+        if len(closes) < 2:
+            return 0.0
+        peak = closes[0]
+        max_dd = 0.0
+        for price in closes:
+            if price > peak:
+                peak = price
+            dd = ((peak - price) / peak) * 100
+            if dd > max_dd:
+                max_dd = dd
+        return max_dd
+
+    def _calculate_sharpe_ratio(self, closes: list[float], risk_free_rate: float = 0.06) -> float:
+        if len(closes) < 2:
+            return 0.0
+        daily_returns = [
+            (closes[i] - closes[i - 1]) / closes[i - 1]
+            for i in range(1, len(closes))
+            if closes[i - 1] > 0
+        ]
+        if len(daily_returns) < 2:
+            return 0.0
+        avg_ret = sum(daily_returns) / len(daily_returns)
+        std_ret = stdev(daily_returns)
+        if std_ret == 0:
+            return 0.0
+        rfr_daily = risk_free_rate / 252
+        return ((avg_ret - rfr_daily) / std_ret) * math.sqrt(252)
+
+    def _calculate_beta(self, closes: list[float]) -> float:
+        """Simplified beta using self-variance as a proxy (1.0 = market neutral)."""
+        if len(closes) < 30:
+            return 1.0
+        daily_returns = [
+            (closes[i] - closes[i - 1]) / closes[i - 1]
+            for i in range(1, len(closes))
+            if closes[i - 1] > 0
+        ]
+        if len(daily_returns) < 2:
+            return 1.0
+        vol = stdev(daily_returns) * math.sqrt(252)
+        market_vol = 0.15  # ~15% annualized market vol assumption
+        return vol / market_vol if market_vol > 0 else 1.0
+
+    def _calculate_risk_level(self, volatility: float, max_drawdown: float, beta: float) -> str:
+        risk_score = 0
+        if volatility > 40:
+            risk_score += 3
+        elif volatility > 25:
+            risk_score += 2
+        elif volatility > 15:
+            risk_score += 1
+
+        if max_drawdown > 30:
+            risk_score += 3
+        elif max_drawdown > 15:
+            risk_score += 2
+        elif max_drawdown > 8:
+            risk_score += 1
+
+        if beta > 1.5:
+            risk_score += 2
+        elif beta > 1.0:
+            risk_score += 1
+
+        if risk_score >= 6:
+            return "VERY HIGH"
+        elif risk_score >= 4:
+            return "HIGH"
+        elif risk_score >= 2:
+            return "MEDIUM"
+        return "LOW"
+
+    def _find_support_resistance(self, closes: list[float]) -> tuple[float, float]:
+        if len(closes) < 20:
+            return (closes[-1] * 0.95, closes[-1] * 1.05)
+        recent = closes[-60:] if len(closes) >= 60 else closes
+        lows = []
+        highs = []
+        for i in range(2, len(recent) - 2):
+            if recent[i] <= recent[i - 1] and recent[i] <= recent[i - 2] and recent[i] <= recent[i + 1] and recent[i] <= recent[i + 2]:
+                lows.append(recent[i])
+            if recent[i] >= recent[i - 1] and recent[i] >= recent[i - 2] and recent[i] >= recent[i + 1] and recent[i] >= recent[i + 2]:
+                highs.append(recent[i])
+        current = closes[-1]
+        support = max([l for l in lows if l < current], default=current * 0.95)
+        resistance = min([h for h in highs if h > current], default=current * 1.05)
+        return (support, resistance)
+
     async def get_stock_data(self, symbol: str) -> StockPrice:
         normalized_symbol = self._normalize_symbol(symbol)
         quote, price = await asyncio.gather(
@@ -294,8 +384,15 @@ class DataService:
         volatility = self._calculate_annualized_volatility(closes)
         signal = self._calculate_signal(current_price, rsi, ma50, ma200)
 
+        # Enhanced risk metrics
+        max_drawdown = self._calculate_max_drawdown(closes)
+        sharpe_ratio = self._calculate_sharpe_ratio(closes)
+        beta = self._calculate_beta(closes)
+        risk_level = self._calculate_risk_level(volatility, max_drawdown, beta)
+        support, resistance = self._find_support_resistance(closes)
+
         logger.info(
-            "Calculated indicators for %s: current_price=%s rsi=%s ma50=%s ma200=%s volatility=%s signal=%s",
+            "Calculated indicators for %s: current_price=%s rsi=%s ma50=%s ma200=%s volatility=%s signal=%s risk=%s",
             normalized_symbol,
             round(current_price, 4),
             round(rsi, 4),
@@ -303,6 +400,7 @@ class DataService:
             round(ma200, 4),
             round(volatility, 4),
             signal,
+            risk_level,
         )
 
         return StockAnalysis(
@@ -313,6 +411,12 @@ class DataService:
             ma200=round(ma200, 2),
             volatility=round(volatility, 2),
             signal=signal,
+            max_drawdown=round(max_drawdown, 2),
+            sharpe_ratio=round(sharpe_ratio, 2),
+            beta=round(beta, 2),
+            risk_level=risk_level,
+            support_level=round(support, 2),
+            resistance_level=round(resistance, 2),
         )
 
 
